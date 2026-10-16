@@ -1,0 +1,316 @@
+import { expect } from "chai";
+import { ethers } from "hardhat";
+import { loadFixture } from "@nomicfoundation/hardhat-network-helpers";
+import { HishmateEscrow, MockUSDC } from "../typechain-types";
+
+const U = (n: number) => BigInt(n) * 1_000_000n; // USDC base units (6 decimals)
+const BOND_PUBLISHER = U(10);
+const BOND_WORKER = U(5);
+const TASK_ID = ethers.id("task-1");
+
+describe("HishmateEscrow", () => {
+  async function fixture() {
+    const [admin, arbitrator, publisher, worker, other] = await ethers.getSigners();
+    const usdc = await (await ethers.getContractFactory("MockUSDC")).deploy();
+    const escrow = await (
+      await ethers.getContractFactory("HishmateEscrow")
+    ).deploy(await usdc.getAddress(), arbitrator.address, admin.address);
+    // Everyone starts with credits on hand.
+    for (const s of [publisher, worker, other]) {
+      await usdc.mint(s.address, U(1000));
+      await usdc.connect(s).approve(await escrow.getAddress(), U(1000));
+    }
+    return { usdc, escrow, admin, arbitrator, publisher, worker, other };
+  }
+
+  /** Solvency invariant: the contract holds exactly what the books say. */
+  async function expectSolvent(
+    usdc: MockUSDC,
+    escrow: HishmateEscrow,
+    users: string[],
+  ) {
+    let books = 0n;
+    for (const u of users) {
+      books += await escrow.balanceOf(u);
+      books += await escrow.bondOf(u);
+    }
+    for (const id of [TASK_ID, ethers.id("task-2")]) {
+      books += (await escrow.tasks(id)).escrow;
+    }
+    expect(await usdc.balanceOf(await escrow.getAddress())).to.equal(books);
+  }
+
+  describe("credits", () => {
+    it("deposits pull USDC in and credit balanceOf", async () => {
+      const { usdc, escrow, publisher } = await loadFixture(fixture);
+      await expect(escrow.connect(publisher).deposit(U(100)))
+        .to.emit(escrow, "Deposited")
+        .withArgs(publisher.address, U(100));
+      expect(await escrow.balanceOf(publisher.address)).to.equal(U(100));
+      expect(await usdc.balanceOf(publisher.address)).to.equal(U(900));
+      await expectSolvent(usdc, escrow, [publisher.address]);
+    });
+
+    it("withdraw pays USDC out to the caller", async () => {
+      const { usdc, escrow, publisher } = await loadFixture(fixture);
+      await escrow.connect(publisher).deposit(U(100));
+      await expect(escrow.connect(publisher).withdraw(U(40)))
+        .to.emit(escrow, "Withdrawn")
+        .withArgs(publisher.address, U(40));
+      expect(await escrow.balanceOf(publisher.address)).to.equal(U(60));
+      expect(await usdc.balanceOf(publisher.address)).to.equal(U(940));
+      await expectSolvent(usdc, escrow, [publisher.address]);
+    });
+
+    it("withdrawFor lets the platform push a payout (platform pays gas)", async () => {
+      const { usdc, escrow, arbitrator, publisher, other } = await loadFixture(fixture);
+      await escrow.connect(publisher).deposit(U(100));
+      await expect(
+        escrow.connect(arbitrator).withdrawFor(publisher.address, U(30)),
+      )
+        .to.emit(escrow, "Withdrawn")
+        .withArgs(publisher.address, U(30));
+      expect(await usdc.balanceOf(publisher.address)).to.equal(U(930));
+      // Only the arbitrator may push.
+      await expect(
+        escrow.connect(other).withdrawFor(publisher.address, U(1)),
+      ).to.be.revertedWithCustomError(escrow, "NotArbitrator");
+      await expectSolvent(usdc, escrow, [publisher.address]);
+    });
+
+    it("rejects withdrawing more than the balance", async () => {
+      const { escrow, publisher } = await loadFixture(fixture);
+      await escrow.connect(publisher).deposit(U(10));
+      await expect(
+        escrow.connect(publisher).withdraw(U(11)),
+      ).to.be.revertedWithCustomError(escrow, "InsufficientBalance");
+    });
+  });
+
+  describe("bond custody", () => {
+    it("depositBond moves credits into custody without freezing per task", async () => {
+      const { escrow, publisher } = await loadFixture(fixture);
+      await escrow.connect(publisher).deposit(U(100));
+      await escrow.connect(publisher).depositBond(U(20));
+      expect(await escrow.bondOf(publisher.address)).to.equal(U(20));
+      expect(await escrow.balanceOf(publisher.address)).to.equal(U(80));
+      // Free custody is the eligibility number: 20 >= 10 → can publish.
+      expect(await escrow.freeBondOf(publisher.address)).to.equal(U(20));
+    });
+
+    it("withdrawBond is blocked while a bond is occupied", async () => {
+      const { escrow, arbitrator, publisher } = await loadFixture(fixture);
+      await escrow.connect(publisher).deposit(U(100));
+      await escrow.connect(publisher).depositBond(U(20));
+      await escrow
+        .connect(arbitrator)
+        .holdBond(publisher.address, TASK_ID, BOND_PUBLISHER);
+      await expect(
+        escrow.connect(publisher).withdrawBond(U(1)),
+      ).to.be.revertedWithCustomError(escrow, "BondOccupied");
+      // Once released it works again — custody itself never left.
+      await escrow
+        .connect(arbitrator)
+        .releaseBond(publisher.address, TASK_ID, BOND_PUBLISHER);
+      await escrow.connect(publisher).withdrawBond(U(20));
+      expect(await escrow.bondOf(publisher.address)).to.equal(0n);
+      expect(await escrow.balanceOf(publisher.address)).to.equal(U(100));
+    });
+
+    it("holdBond refuses to over-occupy custody", async () => {
+      const { escrow, arbitrator, publisher } = await loadFixture(fixture);
+      await escrow.connect(publisher).deposit(U(100));
+      await escrow.connect(publisher).depositBond(U(12));
+      await expect(
+        escrow
+          .connect(arbitrator)
+          .holdBond(publisher.address, TASK_ID, BOND_PUBLISHER + U(3)),
+      ).to.be.revertedWithCustomError(escrow, "InsufficientFreeBond");
+      await escrow
+        .connect(arbitrator)
+        .holdBond(publisher.address, TASK_ID, BOND_PUBLISHER);
+      expect(await escrow.freeBondOf(publisher.address)).to.equal(U(2));
+    });
+
+    it("slashBond destroys custody and pays the counterparty", async () => {
+      const { escrow, arbitrator, publisher, worker } = await loadFixture(fixture);
+      for (const s of [publisher, worker]) {
+        await escrow.connect(s).deposit(U(50));
+        await escrow.connect(s).depositBond(s === publisher ? U(10) : U(5));
+      }
+      await escrow.connect(arbitrator).holdBond(worker.address, TASK_ID, BOND_WORKER);
+      await expect(
+        escrow
+          .connect(arbitrator)
+          .slashBond(worker.address, TASK_ID, BOND_WORKER, publisher.address),
+      )
+        .to.emit(escrow, "BondSlashed")
+        .withArgs(worker.address, TASK_ID, BOND_WORKER, publisher.address);
+      expect(await escrow.bondOf(worker.address)).to.equal(0n);
+      expect(await escrow.heldBondOf(worker.address)).to.equal(0n);
+      // Publisher deposited U(50) then moved U(10) into custody.
+      expect(await escrow.balanceOf(publisher.address)).to.equal(U(40) + BOND_WORKER);
+      // Worker is no longer eligible to take work.
+      expect(await escrow.freeBondOf(worker.address)).to.equal(0n);
+    });
+  });
+
+  describe("task escrow", () => {
+    async function funded() {
+      const f = await loadFixture(fixture);
+      const { escrow, publisher, worker, arbitrator } = f;
+      await escrow.connect(publisher).deposit(U(100));
+      await escrow.connect(publisher).depositBond(BOND_PUBLISHER);
+      await escrow.connect(worker).deposit(U(50));
+      await escrow.connect(worker).depositBond(BOND_WORKER);
+      await escrow.connect(publisher).fundTask(TASK_ID, U(60));
+      await escrow.connect(arbitrator).holdBond(publisher.address, TASK_ID, BOND_PUBLISHER);
+      await escrow.connect(arbitrator).holdBond(worker.address, TASK_ID, BOND_WORKER);
+      return f;
+    }
+
+    it("fundTask locks the bounty and only the funder may fund", async () => {
+      const { escrow, publisher, other } = await loadFixture(fixture);
+      await escrow.connect(publisher).deposit(U(100));
+      await expect(escrow.connect(publisher).fundTask(TASK_ID, U(60)))
+        .to.emit(escrow, "TaskFunded")
+        .withArgs(publisher.address, TASK_ID, U(60));
+      expect((await escrow.tasks(TASK_ID)).escrow).to.equal(U(60));
+      expect((await escrow.tasks(TASK_ID)).funder).to.equal(publisher.address);
+      await escrow.connect(other).deposit(U(10));
+      await expect(
+        escrow.connect(other).fundTask(TASK_ID, U(5)),
+      ).to.be.revertedWithCustomError(escrow, "NotTaskFunder");
+    });
+
+    it("settleTask pays the escrow to the worker and frees both bonds", async () => {
+      const { usdc, escrow, arbitrator, publisher, worker } = await funded();
+      await escrow.connect(arbitrator).settleTask(TASK_ID, worker.address);
+      // Worker deposited U(50) then moved U(5) into custody.
+      expect(await escrow.balanceOf(worker.address)).to.equal(U(45) + U(60));
+      expect((await escrow.tasks(TASK_ID)).escrow).to.equal(0n);
+      // Bonds were occupied, not spent — releasing restores full custody.
+      await escrow.connect(arbitrator).releaseBond(publisher.address, TASK_ID, BOND_PUBLISHER);
+      await escrow.connect(arbitrator).releaseBond(worker.address, TASK_ID, BOND_WORKER);
+      expect(await escrow.bondOf(publisher.address)).to.equal(BOND_PUBLISHER);
+      expect(await escrow.bondOf(worker.address)).to.equal(BOND_WORKER);
+      expect(await escrow.freeBondOf(publisher.address)).to.equal(BOND_PUBLISHER);
+      await expectSolvent(usdc, escrow, [publisher.address, worker.address]);
+    });
+
+    it("refundTask returns the escrow to the funder", async () => {
+      const { usdc, escrow, arbitrator, publisher, worker } = await funded();
+      await escrow.connect(arbitrator).refundTask(TASK_ID);
+      // Publisher deposited U(100), moved U(10) into custody, funded U(60).
+      expect(await escrow.balanceOf(publisher.address)).to.equal(U(90));
+      await escrow.connect(arbitrator).releaseBond(publisher.address, TASK_ID, BOND_PUBLISHER);
+      await escrow.connect(arbitrator).releaseBond(worker.address, TASK_ID, BOND_WORKER);
+      await expectSolvent(usdc, escrow, [publisher.address, worker.address]);
+    });
+
+    it("arbitrateTask splits the escrow and slashes the worker bond", async () => {
+      const { usdc, escrow, arbitrator, publisher, worker } = await funded();
+      await escrow
+        .connect(arbitrator)
+        .arbitrateTask(TASK_ID, worker.address, U(10), BOND_WORKER, true);
+      // Award 10 to the worker, 50 back to the publisher, worker bond gone.
+      // Worker: U(50) - U(5) custody + U(10) award. Publisher: U(100) - U(10)
+      // custody - U(60) escrow + U(50) refund + U(5) slashed bond.
+      expect(await escrow.balanceOf(worker.address)).to.equal(U(55));
+      expect(await escrow.balanceOf(publisher.address)).to.equal(U(85));
+      expect(await escrow.bondOf(worker.address)).to.equal(0n);
+      expect(await escrow.bondOf(publisher.address)).to.equal(BOND_PUBLISHER);
+      // Arbitration only touches the worker bond; the publisher's
+      // occupancy stays until the platform releases it explicitly.
+      expect(await escrow.freeBondOf(publisher.address)).to.equal(0n);
+      await escrow
+        .connect(arbitrator)
+        .releaseBond(publisher.address, TASK_ID, BOND_PUBLISHER);
+      expect(await escrow.freeBondOf(publisher.address)).to.equal(BOND_PUBLISHER);
+      await expectSolvent(usdc, escrow, [publisher.address, worker.address]);
+    });
+
+    it("arbitrateTask can keep the worker bond instead of slashing it", async () => {
+      const { escrow, arbitrator, worker } = await funded();
+      await escrow
+        .connect(arbitrator)
+        .arbitrateTask(TASK_ID, worker.address, U(60), BOND_WORKER, false);
+      expect(await escrow.bondOf(worker.address)).to.equal(BOND_WORKER);
+      expect(await escrow.heldBondOf(worker.address)).to.equal(BOND_WORKER);
+    });
+
+    it("arbitrateTask refuses to slash more bond than the worker holds", async () => {
+      const { escrow, arbitrator, worker } = await funded();
+      // Regression: the old contract tracked the worker bond per task and
+      // accumulated the publisher's occupancy too, so this underflowed.
+      await expect(
+        escrow
+          .connect(arbitrator)
+          .arbitrateTask(TASK_ID, worker.address, U(10), BOND_WORKER + U(1), true),
+      ).to.be.revertedWithCustomError(escrow, "BondTooLarge");
+      // Exactly the held amount is fine.
+      await escrow
+        .connect(arbitrator)
+        .arbitrateTask(TASK_ID, worker.address, U(10), BOND_WORKER, true);
+      expect(await escrow.bondOf(worker.address)).to.equal(0n);
+    });
+
+    it("rejects settling an unfunded or already-settled task", async () => {
+      const { escrow, arbitrator, worker } = await loadFixture(fixture);
+      await expect(
+        escrow.connect(arbitrator).settleTask(ethers.id("nope"), worker.address),
+      ).to.be.revertedWithCustomError(escrow, "TaskNotFunded");
+      await escrow.connect(worker).deposit(U(50));
+      await escrow.connect(worker).fundTask(TASK_ID, U(30));
+      await escrow.connect(arbitrator).settleTask(TASK_ID, worker.address);
+      await expect(
+        escrow.connect(arbitrator).settleTask(TASK_ID, worker.address),
+      ).to.be.revertedWithCustomError(escrow, "TaskAlreadySettled");
+    });
+
+    it("rejects an award larger than the escrow", async () => {
+      const { escrow, arbitrator, publisher, worker } = await funded();
+      await expect(
+        escrow
+          .connect(arbitrator)
+          .arbitrateTask(TASK_ID, worker.address, U(61), BOND_WORKER, false),
+      ).to.be.revertedWithCustomError(escrow, "AwardTooLarge");
+    });
+  });
+
+  describe("access control and pause", () => {
+    it("only the arbitrator moves task money", async () => {
+      const { escrow, other } = await loadFixture(fixture);
+      await expect(
+        escrow.connect(other).settleTask(TASK_ID, other.address),
+      ).to.be.revertedWithCustomError(escrow, "NotArbitrator");
+      await expect(
+        escrow.connect(other).holdBond(other.address, TASK_ID, U(1)),
+      ).to.be.revertedWithCustomError(escrow, "NotArbitrator");
+    });
+
+    it("the owner can move the arbitrator role and pause user actions", async () => {
+      const { escrow, admin, publisher, other } = await loadFixture(fixture);
+      await escrow.connect(admin).setArbitrator(other.address);
+      expect(await escrow.arbitrator()).to.equal(other.address);
+      await escrow.connect(publisher).deposit(U(10));
+      await escrow.connect(admin).pause();
+      await expect(
+        escrow.connect(publisher).withdraw(U(1)),
+      ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
+      await expect(
+        escrow.connect(publisher).deposit(U(1)),
+      ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
+      await escrow.connect(admin).unpause();
+      await escrow.connect(publisher).withdraw(U(10));
+      // Non-owners cannot pause or reassign.
+      await expect(escrow.connect(publisher).pause()).to.be.revertedWithCustomError(
+        escrow,
+        "OwnableUnauthorizedAccount",
+      );
+      await expect(
+        escrow.connect(publisher).setArbitrator(publisher.address),
+      ).to.be.revertedWithCustomError(escrow, "OwnableUnauthorizedAccount");
+    });
+  });
+});

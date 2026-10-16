@@ -1,0 +1,14 @@
+node_modules/
+artifacts/
+cache/
+typechain-types/
+coverage/
+coverage.json
+
+# Never commit keys. DEPLOYER_PRIVATE_KEY and RPC URLs live here.
+.env
+.env.*
+!.env.example
+
+*.log
+.DS_Store
