@@ -1,7 +1,13 @@
 # HishmateEscrow
 
 Custody contract for the [Hishmate](https://hishmate.com) freelance task
-platform. USDC (6 decimals) on Arbitrum.
+platform. USDC (6 decimals) on **Arbitrum One**.
+
+Hishmate itself has been live on Arbitrum One mainnet since October 2026,
+custodying real USDC. Today that custody runs through the platform's treasury
+path; this contract is the **user-self-custody mode** — it activates the day
+the platform sets an `ESCROW_ADDRESS`, after which users move their own money
+with their own wallets and the platform only verifies what happened.
 
 It is the on-chain half of a **custodial** design: the platform keeps an
 internal ledger that mirrors every event emitted here, and the backend verifies
@@ -94,7 +100,8 @@ cost off-chain as a gas reserve — so a worker who is owed money never needs ET
 - **`Pausable`** covers user entry points. Arbitrator functions stay live while
   paused so the platform can still settle or refund during an incident.
 - **Not upgradeable.** There is no proxy. A future hardened version means a new
-  deployment plus a migration, not an in-place fix — plan for that before mainnet.
+  deployment plus a migration, not an in-place fix — before the platform points
+  `ESCROW_ADDRESS` at an instance of this contract, it should be audited.
 
 ## Known trade-offs
 
@@ -132,8 +139,7 @@ personal one**.
 | Variable | Purpose |
 |---|---|
 | `DEPLOYER_PRIVATE_KEY` | Deployer account. Never commit this. |
-| `SEPOLIA_RPC_URL` | Arbitrum Sepolia RPC. |
-| `ARBITRUM_RPC_URL` | Arbitrum One RPC. |
+| `ARBITRUM_ONE_RPC_URL` | Arbitrum One mainnet RPC. |
 
 ---
 
