@@ -26,7 +26,14 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
  *                 live tasks. `freeBondOf` is the eligibility number:
  *                 >= BOND_PUBLISHER means "can publish", >= BOND_WORKER
  *                 means "can take work".
- * - `tasks`       per-task escrow (the bounty) only.
+ * - `tasks`       per-task escrow (the bounty) only, plus the publisher the
+ *                 platform registered for that task id with `openTask`.
+ *
+ * Task ids come from the platform, so a task id alone says nothing about who
+ * is allowed to put money behind it: `fundTask` requires the caller to be the
+ * publisher registered by `openTask`, never "whoever pays first". Without
+ * that binding anyone could burn one unit of dust on a real task id and lock
+ * the real publisher out with `NotTaskFunder` forever.
  *
  * Bond occupancy is deliberately role-agnostic: `holdBond` does not care
  * whether the holder is the publisher or the worker of the task named in the
@@ -76,6 +83,7 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
         uint256 amount,
         address indexed to
     );
+    event TaskOpened(bytes32 indexed task, address indexed publisher);
     event TaskFunded(address indexed publisher, bytes32 indexed task, uint256 amount);
     event TaskSettled(bytes32 indexed task, address indexed worker, uint256 amount);
     event TaskRefunded(bytes32 indexed task, address indexed publisher, uint256 amount);
@@ -86,20 +94,31 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
         uint256 workerBond,
         address indexed bondTo
     );
+    /// @notice Emitted when the requested slash exceeded what the worker
+    /// actually holds, so the caller knows its figure was stale. The amount
+    /// that was applied is the one carried by `BondSlashed` / `TaskArbitrated`.
+    event BondSlashCapped(
+        bytes32 indexed task,
+        address indexed user,
+        uint256 requested,
+        uint256 applied
+    );
     event ArbitratorChanged(address indexed previous, address indexed next);
 
     // ── errors ────────────────────────────────────────────────────────────
     error NotArbitrator();
+    error ZeroAddress();
     error ZeroAmount();
     error InsufficientBalance();
     error InsufficientFreeBond();
     error InsufficientHeldBond();
     error BondOccupied();
+    error TaskNotOpen();
+    error TaskAlreadyOpen();
     error NotTaskFunder();
     error TaskAlreadySettled();
     error TaskNotFunded();
     error AwardTooLarge();
-    error BondTooLarge();
 
     modifier onlyArbitrator() {
         if (msg.sender != arbitrator) revert NotArbitrator();
@@ -109,13 +128,18 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
     constructor(IERC20 usdc_, address arbitrator_, address owner_)
         Ownable(owner_)
     {
+        if (arbitrator_ == address(0)) revert ZeroAddress();
         usdc = usdc_;
         arbitrator = arbitrator_;
         emit ArbitratorChanged(address(0), arbitrator_);
     }
 
     // ── admin ─────────────────────────────────────────────────────────────
+    /// @notice Hand the settlement role over. Refuses the zero address: it
+    /// would leave every payout path permanently dead, and with no proxy
+    /// there is no way to walk that back.
     function setArbitrator(address next) external onlyOwner {
+        if (next == address(0)) revert ZeroAddress();
         emit ArbitratorChanged(arbitrator, next);
         arbitrator = next;
     }
@@ -156,6 +180,7 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
         onlyArbitrator
     {
         if (amount == 0) revert ZeroAmount();
+        if (user == address(0)) revert ZeroAddress();
         if (balanceOf[user] < amount) revert InsufficientBalance();
         balanceOf[user] -= amount;
         usdc.safeTransfer(user, amount);
@@ -191,21 +216,42 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
         return bondOf[user] - heldBondOf[user];
     }
 
+    // ── arbitrator: task registration ─────────────────────────────────────
+    /// @notice Bind a task id to the wallet that is allowed to fund it. The
+    /// platform calls this once when the task opens, before any money moves;
+    /// it pays the gas, exactly like the other arbitrator calls.
+    ///
+    /// This is what makes `fundTask` safe to expose: a task id guessed or
+    /// scraped from the board is worth nothing on its own, because funding it
+    /// from any other wallet reverts with `NotTaskFunder`.
+    function openTask(bytes32 taskId, address publisher) external onlyArbitrator {
+        if (publisher == address(0)) revert ZeroAddress();
+        Task storage t = tasks[taskId];
+        if (t.settled) revert TaskAlreadySettled();
+        // Re-pointing a task that already carries money would move the
+        // refund destination out from under the funder — refuse instead of
+        // silently trusting the caller to get it right.
+        if (t.funder != address(0) && t.funder != publisher) revert TaskAlreadyOpen();
+        t.funder = publisher;
+        emit TaskOpened(taskId, publisher);
+    }
+
     // ── publisher: task escrow ────────────────────────────────────────────
     /// @notice Lock a bounty into a task's escrow out of the caller's
     /// spendable credits. The caller pays the gas — this is the "click to
-    /// disburse" step that puts real USDC behind a task.
+    /// disburse" step that puts real USDC behind a task. Only the publisher
+    /// registered by `openTask` may do it.
     function fundTask(bytes32 taskId, uint256 amount)
         external
         nonReentrant
         whenNotPaused
     {
         if (amount == 0) revert ZeroAmount();
-        if (balanceOf[msg.sender] < amount) revert InsufficientBalance();
         Task storage t = tasks[taskId];
-        if (t.funder == address(0)) t.funder = msg.sender;
-        else if (t.funder != msg.sender) revert NotTaskFunder();
+        if (t.funder == address(0)) revert TaskNotOpen();
+        if (t.funder != msg.sender) revert NotTaskFunder();
         if (t.settled) revert TaskAlreadySettled();
+        if (balanceOf[msg.sender] < amount) revert InsufficientBalance();
         balanceOf[msg.sender] -= amount;
         t.escrow += amount;
         emit TaskFunded(msg.sender, taskId, amount);
@@ -247,6 +293,7 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
         address to
     ) external onlyArbitrator {
         if (amount == 0) revert ZeroAmount();
+        if (to == address(0)) revert ZeroAddress();
         if (heldBondOf[user] < amount) revert InsufficientHeldBond();
         heldBondOf[user] -= amount;
         bondOf[user] -= amount;
@@ -261,6 +308,7 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
         external
         onlyArbitrator
     {
+        if (worker == address(0)) revert ZeroAddress();
         Task storage t = tasks[taskId];
         if (t.settled) revert TaskAlreadySettled();
         uint256 amount = t.escrow;
@@ -286,11 +334,16 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
     /// @notice Arbitration: split the escrow (award to the worker, the rest
     /// back to the funder) and either free or slash the worker bond.
     ///
-    /// `workerBond` is the amount the platform wants to slash out of the
-    /// worker's custody; it is capped by `heldBondOf[worker]` so a wrong
-    /// figure can never underflow. When `slashWorkerBond` is false the
-    /// occupancy simply stays in place and the platform releases it with a
-    /// separate `releaseBond` once the books agree.
+    /// `workerBond` is the amount the platform *wants* to slash out of the
+    /// worker's custody. It is **clamped** to `heldBondOf[worker]` rather than
+    /// rejected: the figure is computed off-chain and a stale one must not be
+    /// able to keep a dispute open until a human notices. A clamp emits
+    /// `BondSlashCapped` so the platform can reconcile its books; the amount
+    /// actually applied is what `BondSlashed` and `TaskArbitrated` report.
+    ///
+    /// When `slashWorkerBond` is false the occupancy simply stays in place and
+    /// the platform releases it with a separate `releaseBond` once the books
+    /// agree.
     function arbitrateTask(
         bytes32 taskId,
         address worker,
@@ -303,17 +356,25 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
         uint256 amount = t.escrow;
         if (amount == 0) revert TaskNotFunded();
         if (award > amount) revert AwardTooLarge();
-        if (workerBond > heldBondOf[worker]) revert BondTooLarge();
+        if (award > 0 && worker == address(0)) revert ZeroAddress();
+
+        uint256 slash = slashWorkerBond ? workerBond : 0;
+        if (slash > heldBondOf[worker]) {
+            emit BondSlashCapped(taskId, worker, workerBond, heldBondOf[worker]);
+            slash = heldBondOf[worker];
+        }
+
         t.settled = true;
         t.escrow = 0;
         if (award > 0) balanceOf[worker] += award;
-        if (amount - award > 0) balanceOf[t.funder] += amount - award;
-        if (slashWorkerBond && workerBond > 0) {
-            heldBondOf[worker] -= workerBond;
-            bondOf[worker] -= workerBond;
-            balanceOf[t.funder] += workerBond;
-            emit BondSlashed(worker, taskId, workerBond, t.funder);
+        if (amount > award) balanceOf[t.funder] += amount - award;
+        if (slash > 0) {
+            heldBondOf[worker] -= slash;
+            bondOf[worker] -= slash;
+            balanceOf[t.funder] += slash;
+            emit BondSlashed(worker, taskId, slash, t.funder);
         }
-        emit TaskArbitrated(taskId, worker, award, workerBond, t.funder);
+        // Reports the slash that actually happened, not the one requested.
+        emit TaskArbitrated(taskId, worker, award, slash, t.funder);
     }
 }

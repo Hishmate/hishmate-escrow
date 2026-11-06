@@ -37,6 +37,7 @@ The `arbitrator` role — held by the platform — can:
 
 | Function | What it can do |
 |---|---|
+| `openTask(taskId, publisher)` | Bind a task id to the wallet allowed to fund it |
 | `settleTask(taskId, worker)` | Send a task's escrow to **any** address it names as worker |
 | `refundTask(taskId)` | Return the escrow to the funder |
 | `arbitrateTask(...)` | Split an escrow and slash a worker's bond |
@@ -72,7 +73,9 @@ Three buckets per user, mirroring the platform's internal ledger 1:1:
 - **`heldBondOf`** — the part of `bondOf` currently occupied by live tasks.
   `freeBondOf = bondOf - heldBondOf` is the eligibility number.
 
-Task bounties live separately in `tasks[taskId].escrow`.
+Task bounties live separately in `tasks[taskId].escrow`. Each task id also
+records the **publisher** the platform registered with `openTask`, which is the
+only wallet allowed to fund it — see [Task funding](#task-funding).
 
 Bond occupancy is **role-agnostic on purpose**: `holdBond` does not care whether
 the holder is the publisher or the worker. The platform knows the roles; the
@@ -82,8 +85,29 @@ matches against its own ledger.
 ### Gas policy
 
 Users pay for the calls they make themselves (`deposit`, `withdraw`,
-`fundTask`). The arbitrator pays for settlement, and the publisher pre-pays that
-cost off-chain as a gas reserve — so a worker who is owed money never needs ETH.
+`fundTask`). The arbitrator pays for `openTask` and settlement, and the
+publisher pre-pays that cost off-chain as a gas reserve — so a worker who is
+owed money never needs ETH.
+
+### Task funding
+
+A task id is a public identifier, so it cannot by itself authorise funding:
+`fundTask` used to accept any caller and lock in the first payer, which meant
+one unit of dust on a real task id would leave the real publisher reverting
+with `NotTaskFunder` forever.
+
+The platform therefore registers the publisher first:
+
+```
+arbitrator: openTask(taskId, publisher)   // once, when the task opens
+publisher:  fundTask(taskId, amount)      // only from that wallet
+```
+
+`openTask` is one arbitrator call per task and can share a transaction batch
+with the publisher's `holdBond`. It is idempotent for the same publisher,
+refuses to re-point a task, and refuses `address(0)`. `fundTask` on an
+unregistered id reverts with `TaskNotOpen`, so guessing or scraping an id is
+worth nothing.
 
 ---
 
@@ -113,8 +137,17 @@ These are deliberate, not oversights, but an auditor will ask:
    compensation, but it is a powerful primitive.
 3. Arbitrator functions are intentionally **not** `whenNotPaused`, so
    settlement continues during a pause.
-4. `fundTask` lets anyone fund, but the first funder for a `taskId` is locked in
-   (`NotTaskFunder` afterwards). Task ids come from the platform.
+4. ~~`fundTask` lets anyone fund, but the first funder for a `taskId` is locked
+   in.~~ **Fixed**: `openTask` binds the publisher on chain, and `fundTask`
+   rejects everyone else with `NotTaskFunder`. See
+   [Task funding](#task-funding).
+5. `arbitrateTask` **clamps** `workerBond` to `heldBondOf[worker]` instead of
+   reverting. A stale figure from the backend must not be able to keep a
+   dispute open; the clamp emits `BondSlashCapped`, and both `BondSlashed` and
+   `TaskArbitrated` report the amount actually applied, not the amount asked
+   for. The platform reconciles against those two events.
+6. Settlement and slash destinations reject `address(0)` — with no proxy, a
+   typo there would burn the money permanently.
 
 ---
 
