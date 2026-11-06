@@ -17,15 +17,19 @@ those events before it credits or moves a single internal unit.
 
 ## ⚠️ Status
 
+> **Review-only source — not deployed.** This repo publishes the `HishmateEscrow`
+> **source code for review**. No instance of this contract exists on any chain
+> (mainnet or testnet). Any address, website, or message claiming to be "the
+> Hishmate escrow contract" is impersonating it. Do not send funds.
+
 | | |
 |---|---|
 | Security audit | **None** |
 | Deployments | **None — not on any network** |
 | Upgradeability | **None (no proxy)** |
 
-This code has **not been audited** and is **not deployed**. Do not send funds to
-any address claiming to be this contract. Read [Trust model](#trust-model)
-before building on it.
+This code has **not been audited**. Read [Trust model](#trust-model) before
+building on it.
 
 ---
 
