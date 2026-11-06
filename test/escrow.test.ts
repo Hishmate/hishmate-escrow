@@ -1,12 +1,13 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
-import { loadFixture } from "@nomicfoundation/hardhat-network-helpers";
+import { loadFixture, time } from "@nomicfoundation/hardhat-network-helpers";
 import { HishmateEscrow, MockUSDC } from "../typechain-types";
 
 const U = (n: number) => BigInt(n) * 1_000_000n; // USDC base units (6 decimals)
 const BOND_PUBLISHER = U(10);
 const BOND_WORKER = U(5);
 const TASK_ID = ethers.id("task-1");
+const ARBITRATOR_DELAY = 2n * 86400n; // matches ARBITRATOR_DELAY in the contract
 
 describe("HishmateEscrow", () => {
   async function fixture() {
@@ -138,11 +139,14 @@ describe("HishmateEscrow", () => {
         await escrow.connect(s).deposit(U(50));
         await escrow.connect(s).depositBond(s === publisher ? U(10) : U(5));
       }
+      await escrow.connect(arbitrator).openTask(TASK_ID, publisher.address);
       await escrow.connect(arbitrator).holdBond(worker.address, TASK_ID, BOND_WORKER);
+      // slashBond now hard-binds its destination to the task funder (the
+      // publisher), so it can never be redirected to an attacker.
       await expect(
         escrow
           .connect(arbitrator)
-          .slashBond(worker.address, TASK_ID, BOND_WORKER, publisher.address),
+          .slashBond(worker.address, TASK_ID, BOND_WORKER),
       )
         .to.emit(escrow, "BondSlashed")
         .withArgs(worker.address, TASK_ID, BOND_WORKER, publisher.address);
@@ -167,6 +171,9 @@ describe("HishmateEscrow", () => {
       // what lets fundTask trust the caller.
       await escrow.connect(arbitrator).openTask(TASK_ID, publisher.address);
       await escrow.connect(publisher).fundTask(TASK_ID, U(60));
+      // The worker is bound once the task is taken — this is what locks the
+      // settlement target so a leaked arbitrator key cannot redirect funds.
+      await escrow.connect(arbitrator).assignWorker(TASK_ID, worker.address);
       await escrow.connect(arbitrator).holdBond(publisher.address, TASK_ID, BOND_PUBLISHER);
       await escrow.connect(arbitrator).holdBond(worker.address, TASK_ID, BOND_WORKER);
       return f;
@@ -221,7 +228,7 @@ describe("HishmateEscrow", () => {
 
     it("settleTask pays the escrow to the worker and frees both bonds", async () => {
       const { usdc, escrow, arbitrator, publisher, worker } = await funded();
-      await escrow.connect(arbitrator).settleTask(TASK_ID, worker.address);
+      await escrow.connect(arbitrator).settleTask(TASK_ID);
       // Worker deposited U(50) then moved U(5) into custody.
       expect(await escrow.balanceOf(worker.address)).to.equal(U(45) + U(60));
       expect((await escrow.tasks(TASK_ID)).escrow).to.equal(0n);
@@ -248,7 +255,7 @@ describe("HishmateEscrow", () => {
       const { usdc, escrow, arbitrator, publisher, worker } = await funded();
       await escrow
         .connect(arbitrator)
-        .arbitrateTask(TASK_ID, worker.address, U(10), BOND_WORKER, true);
+        .arbitrateTask(TASK_ID, U(10), BOND_WORKER, true);
       // Award 10 to the worker, 50 back to the publisher, worker bond gone.
       // Worker: U(50) - U(5) custody + U(10) award. Publisher: U(100) - U(10)
       // custody - U(60) escrow + U(50) refund + U(5) slashed bond.
@@ -270,7 +277,7 @@ describe("HishmateEscrow", () => {
       const { escrow, arbitrator, worker } = await funded();
       await escrow
         .connect(arbitrator)
-        .arbitrateTask(TASK_ID, worker.address, U(60), BOND_WORKER, false);
+        .arbitrateTask(TASK_ID, U(60), BOND_WORKER, false);
       expect(await escrow.bondOf(worker.address)).to.equal(BOND_WORKER);
       expect(await escrow.heldBondOf(worker.address)).to.equal(BOND_WORKER);
     });
@@ -284,7 +291,7 @@ describe("HishmateEscrow", () => {
       await expect(
         escrow
           .connect(arbitrator)
-          .arbitrateTask(TASK_ID, worker.address, U(10), BOND_WORKER + U(1), true),
+          .arbitrateTask(TASK_ID, U(10), BOND_WORKER + U(1), true),
       )
         .to.emit(escrow, "BondSlashCapped")
         .withArgs(TASK_ID, worker.address, BOND_WORKER + U(1), BOND_WORKER)
@@ -302,46 +309,74 @@ describe("HishmateEscrow", () => {
       const { escrow, arbitrator, worker } = await funded();
       await escrow
         .connect(arbitrator)
-        .arbitrateTask(TASK_ID, worker.address, U(60), BOND_WORKER + U(1000), false);
+        .arbitrateTask(TASK_ID, U(60), BOND_WORKER + U(1000), false);
       expect(await escrow.bondOf(worker.address)).to.equal(BOND_WORKER);
       expect(await escrow.heldBondOf(worker.address)).to.equal(BOND_WORKER);
     });
 
     it("rejects settling an unfunded or already-settled task", async () => {
       const { escrow, arbitrator, worker } = await loadFixture(fixture);
-      await expect(
-        escrow.connect(arbitrator).settleTask(ethers.id("nope"), worker.address),
-      ).to.be.revertedWithCustomError(escrow, "TaskNotFunded");
+      // open + assign but no funding yet → the escrow is empty
       await escrow.connect(worker).deposit(U(50));
       await escrow.connect(arbitrator).openTask(TASK_ID, worker.address);
-      await escrow.connect(worker).fundTask(TASK_ID, U(30));
-      await escrow.connect(arbitrator).settleTask(TASK_ID, worker.address);
+      await escrow.connect(arbitrator).assignWorker(TASK_ID, worker.address);
       await expect(
-        escrow.connect(arbitrator).settleTask(TASK_ID, worker.address),
+        escrow.connect(arbitrator).settleTask(TASK_ID),
+      ).to.be.revertedWithCustomError(escrow, "TaskNotFunded");
+      await escrow.connect(worker).fundTask(TASK_ID, U(30));
+      await escrow.connect(arbitrator).settleTask(TASK_ID);
+      await expect(
+        escrow.connect(arbitrator).settleTask(TASK_ID),
       ).to.be.revertedWithCustomError(escrow, "TaskAlreadySettled");
     });
 
-    it("refuses to send money to the zero address", async () => {
-      const { escrow, arbitrator, publisher, worker } = await funded();
-      await expect(
-        escrow.connect(arbitrator).settleTask(TASK_ID, ethers.ZeroAddress),
-      ).to.be.revertedWithCustomError(escrow, "ZeroAddress");
+    it("settlement and slash cannot target an arbitrary or zero address", async () => {
+      // settleTask / arbitrateTask / slashBond no longer take a destination
+      // argument at all: the worker comes from assignWorker and the slash
+      // destination is the task funder. The only remaining zero-address guard
+      // on a payout path is withdrawFor.
+      const { usdc, escrow, arbitrator, publisher, worker } = await funded();
+      // Slashing a task that was never opened must revert, and the slash can
+      // never be steered to the zero address because the destination is the
+      // task's publisher.
       await expect(
         escrow
           .connect(arbitrator)
-          .arbitrateTask(TASK_ID, ethers.ZeroAddress, U(10), 0n, false),
-      ).to.be.revertedWithCustomError(escrow, "ZeroAddress");
-      await expect(
-        escrow
-          .connect(arbitrator)
-          .slashBond(worker.address, TASK_ID, BOND_WORKER, ethers.ZeroAddress),
-      ).to.be.revertedWithCustomError(escrow, "ZeroAddress");
+          .slashBond(worker.address, ethers.id("nope"), BOND_WORKER),
+      ).to.be.revertedWithCustomError(escrow, "TaskNotOpen");
       await expect(
         escrow.connect(arbitrator).withdrawFor(ethers.ZeroAddress, U(1)),
       ).to.be.revertedWithCustomError(escrow, "ZeroAddress");
       // Nothing above moved a unit.
       expect(await escrow.bondOf(worker.address)).to.equal(BOND_WORKER);
       expect(await escrow.balanceOf(publisher.address)).to.equal(U(30));
+      await expectSolvent(usdc, escrow, [publisher.address, worker.address]);
+    });
+
+    it("settleTask / arbitrateTask revert until a worker is assigned", async () => {
+      // A leaked arbitrator key that tries to settle or arbitrate a task
+      // before its worker is bound gets TaskNoWorker — it cannot name the
+      // recipient, because the contract does.
+      const { usdc, escrow, arbitrator, publisher, worker } = await loadFixture(fixture);
+      await escrow.connect(publisher).deposit(U(100));
+      await escrow.connect(publisher).depositBond(BOND_PUBLISHER);
+      await escrow.connect(arbitrator).openTask(TASK_ID, publisher.address);
+      await escrow.connect(publisher).fundTask(TASK_ID, U(60));
+      await escrow.connect(arbitrator).holdBond(publisher.address, TASK_ID, BOND_PUBLISHER);
+      await expect(
+        escrow.connect(arbitrator).settleTask(TASK_ID),
+      ).to.be.revertedWithCustomError(escrow, "TaskNoWorker");
+      await expect(
+        escrow.connect(arbitrator).arbitrateTask(TASK_ID, U(10), 0n, false),
+      ).to.be.revertedWithCustomError(escrow, "TaskNoWorker");
+      // Once the worker is bound both paths open.
+      await escrow.connect(worker).deposit(U(50));
+      await escrow.connect(worker).depositBond(BOND_WORKER);
+      await escrow.connect(arbitrator).assignWorker(TASK_ID, worker.address);
+      await escrow.connect(arbitrator).holdBond(worker.address, TASK_ID, BOND_WORKER);
+      await escrow.connect(arbitrator).settleTask(TASK_ID);
+      expect((await escrow.tasks(TASK_ID)).settled).to.equal(true);
+      await expectSolvent(usdc, escrow, [publisher.address, worker.address]);
     });
 
     it("rejects an award larger than the escrow", async () => {
@@ -349,8 +384,36 @@ describe("HishmateEscrow", () => {
       await expect(
         escrow
           .connect(arbitrator)
-          .arbitrateTask(TASK_ID, worker.address, U(61), BOND_WORKER, false),
+          .arbitrateTask(TASK_ID, U(61), BOND_WORKER, false),
       ).to.be.revertedWithCustomError(escrow, "AwardTooLarge");
+    });
+
+    it("assignWorker binds the worker once and refuses misuse", async () => {
+      const { escrow, arbitrator, publisher, worker, other } = await loadFixture(fixture);
+      // Must open first.
+      await expect(
+        escrow.connect(arbitrator).assignWorker(TASK_ID, worker.address),
+      ).to.be.revertedWithCustomError(escrow, "TaskNotOpen");
+      await escrow.connect(arbitrator).openTask(TASK_ID, publisher.address);
+      // Zero address refused.
+      await expect(
+        escrow.connect(arbitrator).assignWorker(TASK_ID, ethers.ZeroAddress),
+      ).to.be.revertedWithCustomError(escrow, "ZeroAddress");
+      // First binding succeeds.
+      await escrow.connect(arbitrator).assignWorker(TASK_ID, worker.address);
+      expect((await escrow.tasks(TASK_ID)).worker).to.equal(worker.address);
+      // Cannot reassign.
+      await expect(
+        escrow.connect(arbitrator).assignWorker(TASK_ID, other.address),
+      ).to.be.revertedWithCustomError(escrow, "WorkerAlreadySet");
+    });
+
+    it("assignWorker refuses after settlement", async () => {
+      const { escrow, arbitrator, other } = await funded();
+      await escrow.connect(arbitrator).settleTask(TASK_ID);
+      await expect(
+        escrow.connect(arbitrator).assignWorker(TASK_ID, other.address),
+      ).to.be.revertedWithCustomError(escrow, "TaskAlreadySettled");
     });
   });
 
@@ -358,42 +421,61 @@ describe("HishmateEscrow", () => {
     it("only the arbitrator moves task money", async () => {
       const { escrow, other } = await loadFixture(fixture);
       await expect(
-        escrow.connect(other).settleTask(TASK_ID, other.address),
+        escrow.connect(other).settleTask(TASK_ID),
       ).to.be.revertedWithCustomError(escrow, "NotArbitrator");
       await expect(
         escrow.connect(other).holdBond(other.address, TASK_ID, U(1)),
       ).to.be.revertedWithCustomError(escrow, "NotArbitrator");
     });
 
-    it("the owner can move the arbitrator role and pause user actions", async () => {
-      const { escrow, admin, publisher, other } = await loadFixture(fixture);
-      await escrow.connect(admin).setArbitrator(other.address);
+    it("the owner proposes the arbitrator with a delay, then accepts; non-owners cannot", async () => {
+      const { escrow, admin, arbitrator, publisher, other } = await loadFixture(fixture);
+      // Proposing does not change the live arbitrator.
+      await escrow.connect(admin).proposeArbitrator(other.address);
+      expect(await escrow.arbitrator()).to.equal(arbitrator.address);
+      // Accepting before the delay reverts — this is the window a leaked owner
+      // has to be vetoed in (or for monitoring to flag it).
+      await expect(
+        escrow.connect(admin).acceptArbitrator(),
+      ).to.be.revertedWithCustomError(escrow, "ArbitratorChangeTooEarly");
+      // After the delay it lands.
+      await time.increase(ARBITRATOR_DELAY + 1n);
+      await escrow.connect(admin).acceptArbitrator();
       expect(await escrow.arbitrator()).to.equal(other.address);
+      // pause still works for the owner
       await escrow.connect(publisher).deposit(U(10));
       await escrow.connect(admin).pause();
       await expect(
         escrow.connect(publisher).withdraw(U(1)),
       ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
-      await expect(
-        escrow.connect(publisher).deposit(U(1)),
-      ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
       await escrow.connect(admin).unpause();
       await escrow.connect(publisher).withdraw(U(10));
-      // Non-owners cannot pause or reassign.
+      // Non-owners cannot pause or propose.
       await expect(escrow.connect(publisher).pause()).to.be.revertedWithCustomError(
         escrow,
         "OwnableUnauthorizedAccount",
       );
       await expect(
-        escrow.connect(publisher).setArbitrator(publisher.address),
+        escrow.connect(publisher).proposeArbitrator(publisher.address),
       ).to.be.revertedWithCustomError(escrow, "OwnableUnauthorizedAccount");
+    });
+
+    it("cancelArbitratorChange vetoes a pending handover", async () => {
+      const { escrow, admin, arbitrator, other } = await loadFixture(fixture);
+      await escrow.connect(admin).proposeArbitrator(other.address);
+      await escrow.connect(admin).cancelArbitratorChange();
+      // Cancelled: still the old arbitrator, and accept now reverts (no pending).
+      expect(await escrow.arbitrator()).to.equal(arbitrator.address);
+      await expect(
+        escrow.connect(admin).acceptArbitrator(),
+      ).to.be.revertedWithCustomError(escrow, "ZeroAddress");
     });
 
     it("refuses an arbitrator of the zero address", async () => {
       // With no proxy this would strand every payout path permanently.
       const { escrow, admin, usdc } = await loadFixture(fixture);
       await expect(
-        escrow.connect(admin).setArbitrator(ethers.ZeroAddress),
+        escrow.connect(admin).proposeArbitrator(ethers.ZeroAddress),
       ).to.be.revertedWithCustomError(escrow, "ZeroAddress");
       expect(await escrow.arbitrator()).to.not.equal(ethers.ZeroAddress);
       const factory = await ethers.getContractFactory("HishmateEscrow");

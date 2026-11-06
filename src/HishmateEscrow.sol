@@ -55,6 +55,13 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
     /// withdrawals. Settled by the owner.
     address public arbitrator;
 
+    /// @notice Two-step handover: an owner proposal is inert until the delay
+    /// elapses and `acceptArbitrator` is called, giving monitors and the
+    /// (multisig) owner time to veto a hostile change.
+    address public pendingArbitrator;
+    uint256 public arbitratorChangeAt;
+    uint256 public constant ARBITRATOR_DELAY = 2 days;
+
     /// @notice Spendable credits per user.
     mapping(address => uint256) public balanceOf;
     /// @notice Bond in long-term custody per user.
@@ -64,6 +71,7 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
 
     struct Task {
         address funder;
+        address worker;
         uint256 escrow;
         bool settled;
     }
@@ -84,6 +92,7 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
         address indexed to
     );
     event TaskOpened(bytes32 indexed task, address indexed publisher);
+    event WorkerAssigned(bytes32 indexed task, address indexed worker);
     event TaskFunded(address indexed publisher, bytes32 indexed task, uint256 amount);
     event TaskSettled(bytes32 indexed task, address indexed worker, uint256 amount);
     event TaskRefunded(bytes32 indexed task, address indexed publisher, uint256 amount);
@@ -104,6 +113,11 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
         uint256 applied
     );
     event ArbitratorChanged(address indexed previous, address indexed next);
+    /// @notice A new arbitrator was proposed; it becomes effective only after
+    /// `ARBITRATOR_DELAY` has elapsed (see `acceptArbitrator`). A pending
+    /// change is always visible on chain, so monitoring can flag a hostile
+    /// takeover before it lands.
+    event ArbitratorProposed(address indexed next, uint256 effectiveAt);
 
     // ── errors ────────────────────────────────────────────────────────────
     error NotArbitrator();
@@ -115,6 +129,9 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
     error BondOccupied();
     error TaskNotOpen();
     error TaskAlreadyOpen();
+    error TaskNoWorker();
+    error WorkerAlreadySet();
+    error ArbitratorChangeTooEarly();
     error NotTaskFunder();
     error TaskAlreadySettled();
     error TaskNotFunded();
@@ -135,13 +152,38 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
     }
 
     // ── admin ─────────────────────────────────────────────────────────────
-    /// @notice Hand the settlement role over. Refuses the zero address: it
-    /// would leave every payout path permanently dead, and with no proxy
-    /// there is no way to walk that back.
-    function setArbitrator(address next) external onlyOwner {
+    /// @notice Propose a new arbitrator. The change is *not* live until
+    /// `ARBITRATOR_DELAY` has passed and `acceptArbitrator` is called, so a
+    /// leaked owner key cannot hand settlement rights to an attacker in the
+    /// same transaction. Refuses the zero address: with no proxy there is no
+    /// way to walk that back once committed.
+    function proposeArbitrator(address next) external onlyOwner {
         if (next == address(0)) revert ZeroAddress();
+        pendingArbitrator = next;
+        arbitratorChangeAt = block.timestamp + ARBITRATOR_DELAY;
+        emit ArbitratorProposed(next, arbitratorChangeAt);
+    }
+
+    /// @notice Make a previously proposed arbitrator live. Reverts before the
+    /// delay elapses, so monitoring that sees `ArbitratorProposed` has the
+    /// whole window to call `cancelArbitratorChange`.
+    function acceptArbitrator() external onlyOwner {
+        address next = pendingArbitrator;
+        if (next == address(0)) revert ZeroAddress();
+        if (block.timestamp < arbitratorChangeAt)
+            revert ArbitratorChangeTooEarly();
+        pendingArbitrator = address(0);
+        arbitratorChangeAt = 0;
         emit ArbitratorChanged(arbitrator, next);
         arbitrator = next;
+    }
+
+    /// @notice Veto a pending handover. The delay is the only window a leaked
+    /// owner has to act in; the (multisig) owner should cancel on any
+    /// unexpected `ArbitratorProposed`.
+    function cancelArbitratorChange() external onlyOwner {
+        pendingArbitrator = address(0);
+        arbitratorChangeAt = 0;
     }
 
     function pause() external onlyOwner {
@@ -236,6 +278,23 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
         emit TaskOpened(taskId, publisher);
     }
 
+    /// @notice Bind the worker that will receive a `settleTask` award or an
+    /// `arbitrateTask` split for this task. Written exactly once — while
+    /// `worker == address(0)` — and never changed afterwards. This is the
+    /// single most important guard in the contract: it means a leaked
+    /// arbitrator key can only ever pay the task's *real* counterparty, never
+    /// an address of its own choosing. Requires the task to be open first
+    /// (`openTask`), and refuses once settled.
+    function assignWorker(bytes32 taskId, address worker) external onlyArbitrator {
+        if (worker == address(0)) revert ZeroAddress();
+        Task storage t = tasks[taskId];
+        if (t.funder == address(0)) revert TaskNotOpen();
+        if (t.settled) revert TaskAlreadySettled();
+        if (t.worker != address(0)) revert WorkerAlreadySet();
+        t.worker = worker;
+        emit WorkerAssigned(taskId, worker);
+    }
+
     // ── publisher: task escrow ────────────────────────────────────────────
     /// @notice Lock a bounty into a task's escrow out of the caller's
     /// spendable credits. The caller pays the gas — this is the "click to
@@ -284,33 +343,41 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
         emit BondReleased(user, taskId, amount);
     }
 
-    /// @notice Destroy part of a user's custody and pay it to `to` as
-    /// spendable credits (the counterparty's compensation).
+    /// @notice Destroy part of a user's custody and pay it to the task's
+    /// publisher. The destination used to be a free `to` argument — a leaked
+    /// arbitrator key could therefore redirect a worker's bond to itself. It
+    /// is now hard-bound to `tasks[taskId].funder`, the only address slashing
+    /// legitimately compensates, so the bond can never leave the task's
+    /// two parties.
     function slashBond(
         address user,
         bytes32 taskId,
-        uint256 amount,
-        address to
+        uint256 amount
     ) external onlyArbitrator {
         if (amount == 0) revert ZeroAmount();
-        if (to == address(0)) revert ZeroAddress();
+        Task storage t = tasks[taskId];
+        if (t.funder == address(0)) revert TaskNotOpen();
         if (heldBondOf[user] < amount) revert InsufficientHeldBond();
         heldBondOf[user] -= amount;
         bondOf[user] -= amount;
-        balanceOf[to] += amount;
-        emit BondSlashed(user, taskId, amount, to);
+        balanceOf[t.funder] += amount;
+        emit BondSlashed(user, taskId, amount, t.funder);
     }
 
     // ── arbitrator: task money ────────────────────────────────────────────
     /// @notice Approved delivery: the escrowed bounty becomes the worker's
-    /// spendable credits. Bond occupancies are released separately.
-    function settleTask(bytes32 taskId, address worker)
+    /// spendable credits. The worker is the one bound by `assignWorker`, so
+    /// the settlement target is no longer a free parameter — a leaked
+    /// arbitrator key cannot redirect a bounty to itself. Bond occupancies are
+    /// released separately.
+    function settleTask(bytes32 taskId)
         external
         onlyArbitrator
     {
-        if (worker == address(0)) revert ZeroAddress();
         Task storage t = tasks[taskId];
         if (t.settled) revert TaskAlreadySettled();
+        address worker = t.worker;
+        if (worker == address(0)) revert TaskNoWorker();
         uint256 amount = t.escrow;
         if (amount == 0) revert TaskNotFunded();
         t.settled = true;
@@ -346,17 +413,17 @@ contract HishmateEscrow is Ownable, ReentrancyGuard, Pausable {
     /// agree.
     function arbitrateTask(
         bytes32 taskId,
-        address worker,
         uint256 award,
         uint256 workerBond,
         bool slashWorkerBond
     ) external onlyArbitrator {
         Task storage t = tasks[taskId];
         if (t.settled) revert TaskAlreadySettled();
+        address worker = t.worker;
+        if (worker == address(0)) revert TaskNoWorker();
         uint256 amount = t.escrow;
         if (amount == 0) revert TaskNotFunded();
         if (award > amount) revert AwardTooLarge();
-        if (award > 0 && worker == address(0)) revert ZeroAddress();
 
         uint256 slash = slashWorkerBond ? workerBond : 0;
         if (slash > heldBondOf[worker]) {

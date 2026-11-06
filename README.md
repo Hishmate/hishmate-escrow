@@ -38,16 +38,21 @@ The `arbitrator` role — held by the platform — can:
 | Function | What it can do |
 |---|---|
 | `openTask(taskId, publisher)` | Bind a task id to the wallet allowed to fund it |
-| `settleTask(taskId, worker)` | Send a task's escrow to **any** address it names as worker |
+| `assignWorker(taskId, worker)` | Bind the worker **once**; this locks where settlements go |
+| `settleTask(taskId)` | Send the escrow to the **worker bound by `assignWorker`** — the arbitrator can no longer name any address |
 | `refundTask(taskId)` | Return the escrow to the funder |
-| `arbitrateTask(...)` | Split an escrow and slash a worker's bond |
+| `arbitrateTask(taskId, award, bond, slash?)` | Split an escrow and (optionally) slash a worker's bond |
 | `holdBond / releaseBond` | Occupy or free any user's bond |
-| `slashBond(user, taskId, amount, to)` | Destroy part of any user's bond and credit it to **any** address |
+| `slashBond(user, taskId, amount)` | Destroy part of a user's bond and credit it to the **task's publisher** — no free `to` address |
 
-There is **no on-chain dispute process, no timelock, and no multi-sig
-requirement at contract level**. The contract enforces *conservation*
-(`held <= bond`, no double settlement, no overdraft) — it does **not** enforce
-*fairness*. Fairness is the platform's off-chain promise.
+There is **no on-chain dispute process and no timelock**. The contract
+enforces *conservation* (`held <= bond`, no double settlement, no overdraft)
+— it does **not** enforce *fairness*. Fairness is the platform's off-chain
+promise. To bound the blast radius of a leaked key: the arbitrator role is
+handed over in **two steps with a 2-day delay** (`proposeArbitrator` →
+`acceptArbitrator`, vetoable via `cancelArbitratorChange`), and the `owner`
+role — which approves those changes and can pause — **must be a multisig**
+(e.g. Gnosis Safe 2/3), never an EOA.
 
 **If you deploy this, the arbitrator key is the trust anchor.** Compromise it
 and every balance in the contract is at risk. Use a hardware wallet or a
@@ -131,10 +136,15 @@ worth nothing.
 
 These are deliberate, not oversights, but an auditor will ask:
 
-1. `settleTask` lets the arbitrator name *any* worker address. The contract
-   cannot know who actually did the work.
-2. `slashBond` credits an arbitrary `to` address — used for counterparty
-   compensation, but it is a powerful primitive.
+1. ~~`settleTask` lets the arbitrator name *any* worker address.~~ **Fixed**:
+   the worker is bound by `assignWorker(taskId, worker)` — written exactly
+   once, never changed — and `settleTask` reads it from storage. A leaked
+   arbitrator key can only ever pay the task's *real* counterparty, never an
+   address of its own choosing.
+2. ~~`slashBond` credits an arbitrary `to` address.~~ **Fixed**: the
+   destination is now hard-bound to `tasks[taskId].funder` (the publisher), so
+   a slashed bond can never leave the task's two parties and can never be
+   redirected to an attacker.
 3. Arbitrator functions are intentionally **not** `whenNotPaused`, so
    settlement continues during a pause.
 4. ~~`fundTask` lets anyone fund, but the first funder for a `taskId` is locked
@@ -146,8 +156,18 @@ These are deliberate, not oversights, but an auditor will ask:
    dispute open; the clamp emits `BondSlashCapped`, and both `BondSlashed` and
    `TaskArbitrated` report the amount actually applied, not the amount asked
    for. The platform reconciles against those two events.
-6. Settlement and slash destinations reject `address(0)` — with no proxy, a
-   typo there would burn the money permanently.
+6. The arbitrator role is handed over in **two steps with a delay**:
+   `proposeArbitrator(next)` is inert for `ARBITRATOR_DELAY` (2 days) until
+   `acceptArbitrator()` is called, and `cancelArbitratorChange()` vetoes it.
+   This gives monitors and the owner a window to block a hostile takeover if
+   the owner key leaks. `ArbitratorProposed` is emitted on-chain when a change
+   is proposed.
+7. **`owner` must be a multisig (e.g. Gnosis Safe 2/3), not an EOA.** The owner
+   can pause, can deploy, and is the only account that approves arbitrator
+   changes — making it a single EOA would re-introduce a single point of
+   failure above the arbitrator. Pass the Safe address as `owner_` at deploy
+   time. `address(0)` is still guarded wherever it would burn funds
+   (`withdrawFor`, `assignWorker`, `proposeArbitrator`, the constructor).
 
 ---
 
