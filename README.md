@@ -169,6 +169,37 @@ These are deliberate, not oversights, but an auditor will ask:
    time. `address(0)` is still guarded wherever it would burn funds
    (`withdrawFor`, `assignWorker`, `proposeArbitrator`, the constructor).
 
+   **Deployment enforces this.** `scripts/deploy.ts` refuses to deploy when
+   `OWNER_ADDRESS` has no contract code (i.e. is an EOA), so the mistake cannot
+   reach a live network. The check runs against the target chain, confirming
+   the Safe exists before any gas is spent.
+
+### Deploying with a Safe (C4)
+
+1. Create a **Gnosis Safe** on the target chain (Arbitrum One for mainnet) at
+   <https://app.safe.global>. Threshold **2-of-3** is a good default: you hold
+   two keys, and a third (e.g. a trusted device or co-signer) covers loss.
+2. Fund the Safe with a little ETH for gas (or let the deployer pay on its
+   behalf — the Safe only needs to *sign* `pause`/`proposeArbitrator`, which
+   it does off-chain).
+3. Choose an `ARBITRATOR_ADDRESS`: a dedicated ops wallet is fine. With the C1
+   settlement target binding, a leaked arbitrator key can no longer redirect
+   payouts, so a hot key is acceptable here (a Safe is also fine if you prefer
+   slower settlement).
+4. Set env and deploy:
+
+   ```bash
+   export DEPLOYER_PRIVATE_KEY=0x...          # pays deployment gas
+   export USDC_ADDRESS=0xaf88d065e77c8cC2239327C5EDb3A432268e5831  # mainnet USDC
+   export OWNER_ADDRESS=0xYOUR_SAFE            # must be the Safe contract
+   export ARBITRATOR_ADDRESS=0xYOUR_OPS_KEY
+   npx hardhat run scripts/deploy.ts --network arbitrumSepolia   # testnet first
+   npx hardhat run scripts/deploy.ts --network arbitrum          # then mainnet
+   ```
+5. Verify on Arbiscan with the printed command. The address is public — that
+   is the point: anyone can see the platform's settlement logic is owned by a
+   multi-sig, not a person.
+
 ---
 
 ## Usage
