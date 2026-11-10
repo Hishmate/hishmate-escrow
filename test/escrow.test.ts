@@ -484,4 +484,173 @@ describe("HishmateEscrow", () => {
       ).to.be.revertedWithCustomError(factory, "ZeroAddress");
     });
   });
+
+  describe("self-audit hardening (conservation + state machine + pause)", () => {
+    // Mirrors the `funded()` helper from the "task escrow" block so this suite
+    // is self-contained at the outer describe scope.
+    async function funded() {
+      const f = await loadFixture(fixture);
+      const { escrow, publisher, worker, arbitrator } = f;
+      await escrow.connect(publisher).deposit(U(100));
+      await escrow.connect(publisher).depositBond(BOND_PUBLISHER);
+      await escrow.connect(worker).deposit(U(50));
+      await escrow.connect(worker).depositBond(BOND_WORKER);
+      await escrow.connect(arbitrator).openTask(TASK_ID, publisher.address);
+      await escrow.connect(publisher).fundTask(TASK_ID, U(60));
+      await escrow.connect(arbitrator).assignWorker(TASK_ID, worker.address);
+      await escrow.connect(arbitrator).holdBond(publisher.address, TASK_ID, BOND_PUBLISHER);
+      await escrow.connect(arbitrator).holdBond(worker.address, TASK_ID, BOND_WORKER);
+      return f;
+    }
+
+    // ① Conservation: every operation leaves the contract solvent. Walks the
+    // full lifecycle and re-checks the invariant after each step, so a
+    // silently minted or burned unit of USDC fails loudly (Nordin step 1).
+    it("stays solvent through the whole credit/bond/task lifecycle", async () => {
+      const { usdc, escrow, admin, arbitrator, publisher, worker, other } =
+        await loadFixture(fixture);
+      const users = [publisher.address, worker.address, other.address];
+
+      await escrow.connect(publisher).deposit(U(200));
+      await expectSolvent(usdc, escrow, users);
+      await escrow.connect(publisher).depositBond(BOND_PUBLISHER);
+      await expectSolvent(usdc, escrow, users);
+      await escrow.connect(worker).deposit(U(100));
+      await escrow.connect(worker).depositBond(BOND_WORKER);
+      await expectSolvent(usdc, escrow, users);
+
+      await escrow.connect(arbitrator).openTask(TASK_ID, publisher.address);
+      await escrow.connect(publisher).fundTask(TASK_ID, U(60));
+      await expectSolvent(usdc, escrow, users);
+      await escrow.connect(arbitrator).assignWorker(TASK_ID, worker.address);
+      await escrow.connect(arbitrator).holdBond(publisher.address, TASK_ID, BOND_PUBLISHER);
+      await escrow.connect(arbitrator).holdBond(worker.address, TASK_ID, BOND_WORKER);
+      await expectSolvent(usdc, escrow, users);
+
+      // Platform pushes a payout on the worker's behalf.
+      await escrow.connect(arbitrator).withdrawFor(worker.address, U(10));
+      await expectSolvent(usdc, escrow, users);
+
+      // Slash the worker bond to the publisher, then release the publisher hold.
+      await escrow.connect(arbitrator).slashBond(worker.address, TASK_ID, BOND_WORKER);
+      await expectSolvent(usdc, escrow, users);
+      await escrow.connect(arbitrator).releaseBond(publisher.address, TASK_ID, BOND_PUBLISHER);
+      await expectSolvent(usdc, escrow, users);
+
+      // Settle the bounty to the worker.
+      await escrow.connect(arbitrator).settleTask(TASK_ID);
+      await expectSolvent(usdc, escrow, users);
+
+      // Cash out and pull bond back.
+      await escrow.connect(worker).withdraw(U(20));
+      await escrow.connect(publisher).withdrawBond(BOND_PUBLISHER);
+      await expectSolvent(usdc, escrow, users);
+
+      // Pause blocks further user withdrawals (guard, not conservation).
+      await escrow.connect(admin).pause();
+      await expect(
+        escrow.connect(worker).withdraw(U(1)),
+      ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
+      await escrow.connect(admin).unpause();
+      await expectSolvent(usdc, escrow, users);
+    });
+
+    // ② State machine: a task can only be closed once — no double-pay or lock
+    // (Nordin step 2). Every money-moving path must reject a settled task.
+    it("a settled task rejects every further money-moving call", async () => {
+      const { usdc, escrow, arbitrator, publisher, worker } = await funded();
+      await escrow.connect(arbitrator).settleTask(TASK_ID);
+      await expect(
+        escrow.connect(arbitrator).settleTask(TASK_ID),
+      ).to.be.revertedWithCustomError(escrow, "TaskAlreadySettled");
+      await expect(
+        escrow.connect(arbitrator).refundTask(TASK_ID),
+      ).to.be.revertedWithCustomError(escrow, "TaskAlreadySettled");
+      await expect(
+        escrow.connect(arbitrator).arbitrateTask(TASK_ID, U(10), 0n, false),
+      ).to.be.revertedWithCustomError(escrow, "TaskAlreadySettled");
+      await expect(
+        escrow.connect(publisher).fundTask(TASK_ID, U(1)),
+      ).to.be.revertedWithCustomError(escrow, "TaskAlreadySettled");
+      await expect(
+        escrow.connect(arbitrator).openTask(TASK_ID, publisher.address),
+      ).to.be.revertedWithCustomError(escrow, "TaskAlreadySettled");
+      await expectSolvent(usdc, escrow, [publisher.address, worker.address]);
+    });
+
+    it("an arbitrated task also rejects settle / refund / open", async () => {
+      const { usdc, escrow, arbitrator, publisher, worker } = await funded();
+      await escrow
+        .connect(arbitrator)
+        .arbitrateTask(TASK_ID, U(10), BOND_WORKER, true);
+      await expect(
+        escrow.connect(arbitrator).settleTask(TASK_ID),
+      ).to.be.revertedWithCustomError(escrow, "TaskAlreadySettled");
+      await expect(
+        escrow.connect(arbitrator).refundTask(TASK_ID),
+      ).to.be.revertedWithCustomError(escrow, "TaskAlreadySettled");
+      await expectSolvent(usdc, escrow, [publisher.address, worker.address]);
+    });
+
+    it("fundTask can top up but never mints or loses USDC", async () => {
+      const { usdc, escrow, arbitrator, publisher, worker } = await loadFixture(fixture);
+      await escrow.connect(publisher).deposit(U(100));
+      await escrow.connect(arbitrator).openTask(TASK_ID, publisher.address);
+      await escrow.connect(publisher).fundTask(TASK_ID, U(40));
+      await escrow.connect(publisher).fundTask(TASK_ID, U(20));
+      expect((await escrow.tasks(TASK_ID)).escrow).to.equal(U(60));
+      expect(await escrow.balanceOf(publisher.address)).to.equal(U(40));
+      await expectSolvent(usdc, escrow, [publisher.address, worker.address]);
+    });
+
+    it("holdBond / slashBond refuse to exceed custody", async () => {
+      const { usdc, escrow, arbitrator, publisher, worker } = await funded();
+      await expect(
+        escrow.connect(arbitrator).holdBond(publisher.address, TASK_ID, BOND_PUBLISHER + U(1)),
+      ).to.be.revertedWithCustomError(escrow, "InsufficientFreeBond");
+      await expect(
+        escrow.connect(arbitrator).slashBond(worker.address, TASK_ID, BOND_WORKER + U(1)),
+      ).to.be.revertedWithCustomError(escrow, "InsufficientHeldBond");
+      await expectSolvent(usdc, escrow, [publisher.address, worker.address]);
+    });
+
+    // ③ Pause must guard every user-facing value-moving entry point
+    // (Nordin step 3). Only `withdraw` was covered before; check them all.
+    it("pause blocks withdraw, withdrawFor, deposit, fundTask, depositBond, withdrawBond", async () => {
+      const { escrow, admin, arbitrator, publisher } = await funded();
+      await escrow.connect(admin).pause();
+      await expect(
+        escrow.connect(publisher).withdraw(U(1)),
+      ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
+      await expect(
+        escrow.connect(arbitrator).withdrawFor(publisher.address, U(1)),
+      ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
+      await expect(
+        escrow.connect(publisher).deposit(U(1)),
+      ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
+      await expect(
+        escrow.connect(publisher).fundTask(TASK_ID, U(1)),
+      ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
+      await expect(
+        escrow.connect(publisher).depositBond(BOND_PUBLISHER),
+      ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
+      await expect(
+        escrow.connect(publisher).withdrawBond(BOND_PUBLISHER),
+      ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
+      // Unpausing restores access.
+      await escrow.connect(admin).unpause();
+      await escrow.connect(publisher).withdraw(U(10));
+    });
+
+    // ③ withdrawFor can only move a user's own balance, and only by the arbitrator.
+    it("withdrawFor cannot over-drain or be called by a non-arbitrator", async () => {
+      const { escrow, arbitrator, publisher, other } = await funded();
+      await expect(
+        escrow.connect(arbitrator).withdrawFor(publisher.address, U(1000)),
+      ).to.be.revertedWithCustomError(escrow, "InsufficientBalance");
+      await expect(
+        escrow.connect(other).withdrawFor(publisher.address, U(1)),
+      ).to.be.revertedWithCustomError(escrow, "NotArbitrator");
+    });
+  });
 });
